@@ -10,6 +10,7 @@
 .claude/
 .codex/
 .mcp.json
+.mcp.json.*
 .isaac
 
 # Demo script artifacts
