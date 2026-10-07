@@ -1,0 +1,24 @@
+# This is a Declarative Automation Bundle definition for dais-ai-runtime.
+# The Databricks extension requires databricks.yml configuration file.
+# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+
+bundle:
+  name: dais-ai-runtime
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://fevm-ssa-team-sandbox-classic.cloud.databricks.com
+      # Three profiles in ~/.databrickscfg share this host (DEFAULT,
+      # serverless-sandbox, fevm-ssa-team-sandbox-classic), and the CLI refuses
+      # to guess — naming one here keeps `databricks bundle ...` working from the
+      # repo directory without DATABRICKS_CONFIG_PROFILE set.
+      profile: fevm-ssa-team-sandbox-classic
+
+  ## Optionally, there could be 'staging' or 'prod' targets here.
+  #
+  # prod:
+  #   workspace:
+  #     host: https://fevm-ssa-team-sandbox-classic.cloud.databricks.com

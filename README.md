@@ -1,0 +1,201 @@
+# DAIS AI Runtime Demo
+
+This project contains a Databricks AI Runtime demo for fine-tuning a small language model on credit-card fraud transactions, registering it as a custom LLM, deploying it to Mosaic AI Model Serving, and load testing the deployed endpoint.
+
+The demo uses the IBM TabFormer credit-card dataset and prepares a supervised fine-tuning table where each row contains a transaction prompt and target assistant response.
+
+## Project Layout
+
+| Path | Purpose |
+| --- | --- |
+| `setup/01_load_tabformer_dataset.py` | Databricks notebook that downloads TabFormer, cleans transaction data, and overwrites Delta tables. |
+| `setup/02_load_model_weights_to_volume.py` | Databricks notebook that mirrors the base model weights from the Hugging Face Hub into a Unity Catalog volume. |
+| `setup/setup.yaml` | Ingestion configuration: catalog, schema, table names, staging volume, source URL, SFT shard count, and the base-model mirror settings. |
+| `train/runner.py` | Databricks notebook for AIR fine-tuning with Hugging Face TRL, MLflow registration, and Model Serving deployment. |
+| `train/train.py` | Standalone training module: imported by the notebook's `@distributed` cell and runnable directly via the AI Runtime CLI. |
+| `train/train.yaml` | AI Runtime CLI workload definition (`air run --file train.yaml`) plus the training, registration, and serving configuration (`parameters.training_config` section). |
+| `load_test/load_test_serving_endpoint.py` | Databricks notebook that simulates high-QPS traffic against the deployed serving endpoint. |
+| `load_test/serving_load_test.yaml` | Load-test configuration. |
+| `train/training_utils.py` | Shared notebook utilities for YAML config loading and Unity Catalog name handling. |
+| `train/requirements.txt` | Python dependencies used by the AIR training notebook. |
+| `databricks.yml` | Databricks bundle metadata used by the Databricks extension/CLI. |
+| `demo_script/` | Demo script materials. |
+
+## Prerequisites
+
+- Databricks workspace with Unity Catalog enabled.
+- A Unity Catalog catalog that already exists.
+- Permission to create schemas, volumes, tables, registered models, and serving endpoints in the target catalog/schema.
+- Databricks serverless compute for ingestion and load testing.
+- Databricks Serverless GPU with AI Runtime for training.
+- Model Serving access with GPU workloads enabled for custom LLM serving.
+- Local Databricks CLI authentication if running notebooks or scripts from this repository with Databricks Connect.
+
+## Configuration
+
+Update these files before running the demo:
+
+- `setup/setup.yaml`
+  - `catalog` and `schema`
+  - `table` and `sft_table`
+  - `sft_volume` (volume for the Parquet export of the SFT table)
+  - `staging_volume`
+  - `source_url`
+  - `model_name` (Hugging Face repo id of the base checkpoint; must match `train.yaml`'s `model_name`)
+  - `model_volume` and `model_revision` (destination volume and Hub revision for the mirrored weights)
+
+- `train/train.yaml` (`parameters.training_config` section; the top-level fields configure the AI Runtime CLI workload)
+  - `experiment_name` (top level): the MLflow experiment used by both the notebook and the CLI
+  - `catalog`, `schema`, `source_table`, and `sft_table`
+  - `checkpoint_volume`
+  - `uc_model_name`
+  - `endpoint_name`
+  - training parameters such as `max_steps`, `training_sample_fraction`, batch size, and learning rate
+  - serving parameters such as `serving_workload_type`, `serving_workload_size`, and `serving_scale_to_zero`
+
+- `load_test/serving_load_test.yaml`
+  - `endpoint_name` (must match `train.yaml`)
+  - `enable_thinking` (must match the training render)
+  - `target_qps`
+  - `duration_seconds`
+  - load-generator worker and concurrency settings
+
+## Demo Flow
+
+1. Ingest and prepare the dataset.
+
+   Run `setup/01_load_tabformer_dataset.py` on Databricks serverless compute. The notebook:
+
+   - Creates the configured schema if it does not exist.
+   - Creates the configured staging volume if it does not exist.
+   - Downloads and extracts the IBM TabFormer transactions archive.
+   - Standardizes transaction columns and data types.
+   - Adds prompt-ready transaction fields and fraud labels.
+   - Writes the cleaned transaction Delta table.
+   - Writes the prepared SFT Delta table with prompt, response, and shard columns.
+   - Exports the SFT records to a Unity Catalog volume as Parquet files partitioned by `shard_id`, per the [AI Runtime data-loading guidance](https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes).
+   - Overwrites target tables on each run.
+
+2. Mirror the base model weights into Unity Catalog (optional).
+
+   Run `setup/02_load_model_weights_to_volume.py` on Databricks serverless compute. The notebook:
+
+   - Creates the configured model volume if it does not exist.
+   - Resolves `model_revision` to a commit SHA and downloads every file of that snapshot except the `model_ignore_patterns` matches.
+   - Copies each file to the volume one at a time, deleting the local copy in between, so local disk use stays bounded and volume writes stay sequential.
+   - Skips files already mirrored at the size the Hub reports, unless `force_model_download` is set.
+   - Writes a provenance JSON beside the weights directory and verifies the snapshot (config, tokenizer, and every safetensors shard named in the index).
+
+   Point training at the mirror by setting `train/train.yaml`'s `model_name` to the printed `/Volumes/...` path; leaving it as the Hub repo id makes each training run download the weights itself.
+
+3. Fine-tune with AI Runtime.
+
+   Run `train/runner.py` on Databricks Serverless GPU with AI Runtime. The notebook:
+
+   - Installs `train/requirements.txt`.
+   - Reads the rank-sharded SFT Parquet files from the Unity Catalog volume with Hugging Face `datasets` (no Spark on the GPU workers).
+   - Fine-tunes `Qwen/Qwen3.5-4B` (text backbone only) with TRL supervised fine-tuning and PEFT LoRA, computing loss on the assistant response only, with thinking suppressed via `enable_thinking=False`.
+   - Uses the `@distributed` decorator so the same training cell can run on one GPU or multiple GPUs by changing the `gpus` parameter.
+   - Saves rank-0 adapter artifacts to a Unity Catalog volume.
+   - Logs training metrics to MLflow.
+
+   The training implementation lives in `train/train.py` and can also run without the notebook through the AI Runtime CLI — see [Training via the AI Runtime CLI](#training-via-the-ai-runtime-cli).
+
+4. Register the custom LLM.
+
+   The training notebook includes a separate registration section, split into three cells because the training and serving environments cannot coexist in one Python session:
+
+   - **Merge**: loads the saved adapter, merges it into the base model, and writes merged Hugging Face weights to `/local_disk0`.
+   - **Install the serving stack**: two `pip` passes — `vllm==0.24.0`, `transformers==5.13.0`, `mlflow==3.14.0`, `flashinfer-cubin`, then `opencv-python-headless==4.12.0.88` on top (pip warns about the conflict; that is expected, and anything `>=4.13` fails the OpenSSL FIPS self-test on Model Serving pods) — followed by `%restart_python`.
+   - **Register**: configures a vLLM OpenAI-compatible server entrypoint for `llm/v1/chat` with `--language-model-only`, and registers the MLflow model to Unity Catalog with `env_pack="databricks_model_serving"`, which captures the environment installed above.
+
+   Note for anyone reusing this pin set: `opencv-python-headless<4.13` carries a known RCE CVE, which is why the managed Foundation Model path does not ship this combination.
+
+5. Deploy the serving endpoint.
+
+   If `deploy_endpoint: true` in `train/train.yaml`'s `training_config`, the training notebook creates or updates the configured Model Serving endpoint and routes 100% of traffic to the registered model version.
+
+6. Load test the endpoint.
+
+   Run `load_test/load_test_serving_endpoint.py` after the endpoint is ready. The notebook:
+
+   - Samples prompts from the SFT Delta table.
+   - Runs a smoke test against the endpoint.
+   - Generates asynchronous HTTP traffic from Spark tasks.
+   - Records achieved throughput, status counts, latency samples, and summary metrics to a Delta table.
+
+## Training via the AI Runtime CLI
+
+The same training code that the notebook's `@distributed` cell runs can be submitted from a laptop with the [AI Runtime CLI](https://docs.databricks.com/aws/en/machine-learning/ai-runtime/cli/), without opening a notebook. `train/train.yaml` is the single configuration file for both paths: its top-level fields define the CLI workload (experiment, environment, compute, code snapshot, command) and its `parameters.training_config` section holds the demo's own training/registration/serving settings.
+
+1. Install the CLI (requires Python 3.10+ and [uv](https://docs.astral.sh/uv/)):
+
+   ```bash
+   uv tool install --force databricks-air --python 3.12
+   air --version
+   ```
+
+2. Authenticate. The CLI reuses Databricks CLI profiles from `~/.databrickscfg`:
+
+   ```bash
+   databricks auth login --host https://<your-workspace>.cloud.databricks.com
+   ```
+
+3. Submit the training workload (run ingestion first — training reads the Parquet shard export it produces):
+
+   ```bash
+   cd train && COPYFILE_DISABLE=1 air run --file train.yaml --watch -p <profile>
+   ```
+
+   `--watch` streams the job state and node logs until the run finishes. Validate the file without submitting using `--dry-run`, and override config values per run without editing the file, for example:
+
+   ```bash
+   COPYFILE_DISABLE=1 air run --file train.yaml \
+     --override parameters.training_config.max_steps=50 --watch
+   ```
+
+   `COPYFILE_DISABLE=1` is required on macOS: without it, bsdtar embeds AppleDouble (`._*`) metadata entries in the code-snapshot tarball, the remote launcher resolves the code directory from the archive's first entry, and the job fails before user code with `can't open file '/databricks/code_source/._train/train.py'`. See `demo_script/air-cli-appledouble-tarball-error.md` for the full diagnosis and two related CLI workarounds already baked into this repo (`$HYPERPARAMETERS_PATH` shape handling in `training_utils.py`, and the `DATABRICKS_RUNTIME_VERSION` entry under `env_variables` in `train.yaml`).
+
+4. Monitor and manage runs:
+
+   ```bash
+   air list runs --limit 10        # recent runs (--active for running only)
+   air get run <run-id>            # status and configuration for one run
+   air logs <run-id>               # stream logs (defaults to node 0)
+   air cancel <run-id>             # stop a run (do this on failures — max_retries
+                                   # otherwise reruns the same broken workload)
+   ```
+
+Runs land in the same MLflow experiment as notebook runs — AIR resolves `experiment_name` to `/Users/<you>/<experiment_name>`, and the notebook resolves that same field through `training_utils.resolve_experiment_path()` — with two markers distinguishing the launch path: the run name carries an `-air-cli` suffix and the run is tagged `submitted_via: air-cli` (notebook runs are tagged `submitted_via: notebook`). Filter with `tags.submitted_via = 'air-cli'` in the MLflow UI.
+
+To scale up, edit `compute` in `train.yaml` (for example `num_accelerators: 8` with `accelerator_type: GPU_8xH100`) — `train.py` resolves rank and world size from the runtime, and each rank loads only its own `shard_id` directories from the Parquet export. The CLI path runs training only; model registration and endpoint deployment remain in the notebook's later cells, which read the adapter directory that training writes to the checkpoint volume.
+
+## Local Development
+
+Create and activate a virtual environment if needed:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+Install local dependencies:
+
+```bash
+.venv/bin/python -m pip install -r train/requirements.txt
+```
+
+The ingestion notebook can run with Databricks Connect when authentication is configured:
+
+```bash
+databricks auth profiles
+.venv/bin/python setup/01_load_tabformer_dataset.py
+```
+
+The training notebook is intended to run on Databricks Serverless GPU because it depends on AI Runtime, GPU hardware, and the `serverless_gpu` distributed runtime.
+
+## References
+
+- Databricks AI Runtime: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/
+- Databricks custom LLM serving: https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms
+- IBM TabFormer dataset: https://github.com/IBM/TabFormer
