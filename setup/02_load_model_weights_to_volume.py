@@ -22,14 +22,14 @@
 # MAGIC %md
 # MAGIC ## Compute and dependency setup
 # MAGIC
-# MAGIC Run this notebook on Databricks serverless compute (no GPU needed — nothing is loaded into a model here, the bytes are only copied).
+# MAGIC Run this notebook on Databricks serverless compute (no GPU needed — nothing is loaded into a model here, the bytes are only copied), on environment version 5 or above: the install cell uses `%uv pip`, which classic compute and earlier serverless versions don't support.
 # MAGIC It has to run **in the workspace**: the destination is a volume FUSE path, which does not exist on a local Databricks Connect client.
 # MAGIC
 # MAGIC `hf_transfer` is installed for the Rust-based multipart downloader; it is enabled below only if the import succeeds.
 
 # COMMAND ----------
 
-# MAGIC %pip install -qqq "huggingface_hub>=0.34.0" "hf_transfer>=0.1.9" "pyyaml>=6.0.2" "pandas>=2.2.0"
+# MAGIC %uv pip install -q "huggingface_hub>=0.34.0" "hf_transfer>=0.1.9" "pyyaml>=6.0.2" "pandas>=2.2.0"
 # MAGIC %restart_python
 
 # COMMAND ----------

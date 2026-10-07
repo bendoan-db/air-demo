@@ -1,73 +1,62 @@
-# Combined AI Runtime CLI workload definition and demo training configuration.
-#
-# Submit training from this directory with:
-#   air run --file train.yaml --watch
-#
-# The top-level fields follow the AI Runtime workload schema
-# (https://docs.databricks.com/aws/en/machine-learning/ai-runtime/cli/).
-# The parameters.training_config section is the demo's own configuration,
-# read by train.py and by the runner notebook (training, registration, and
-# serving settings). AIR also exposes it on the cluster via
-# $HYPERPARAMETERS_PATH, which load_training_config() prefers so that
-# `air run --override` values reach the training script.
+# AI Runtime workload for the demo's training step, plus the demo's own
+# configuration under `parameters`. From the repo root:
+#   databricks air run --file train/train.yaml --dry-run   # validate only
+#   databricks air run --file train/train.yaml --watch     # submit + stream logs
+# Field reference (unknown keys are rejected):
+# https://docs.databricks.com/aws/en/machine-learning/ai-runtime/cli/yaml-config
 
-# MLflow experiment for BOTH launch paths. AIR resolves this name to
-# /Users/<user>/<experiment_name>; the runner notebook resolves the same name
-# through training_utils.resolve_experiment_path(), so notebook and CLI runs
-# land in one experiment. Keep it alphanumeric/-/_ — it also becomes a Jobs API
-# task key.
+# ---------------------------------------------------------------------------
+# Required AI Runtime fields
+# ---------------------------------------------------------------------------
+
+# MLflow experiment shared by CLI and notebook runs. Also the Jobs task key:
+# letters, digits, - and _ only, at most 100 characters.
 experiment_name: qwen35_4b_sft_training
-environment:
-  # Serverless GPU environment version 6 (Public Preview): Python 3.12, CUDA 13,
-  # transformers 5.8, trl 0.24, peft 0.19, accelerate 1.13, datasets 4.8.
-  # https://docs.databricks.com/aws/en/release-notes/serverless/environment-version/six-gpu
-  # v6 dropped bitsandbytes, xformers, and unsloth from the base image, and no
-  # longer bundles torch in any base environment — hence the explicit torch pin.
-  version: 'databricks_ai_v6'
-  # Keep in sync with train/requirements.txt.
-  dependencies:
-    - pyyaml>=6.0.2
-    - pandas>=2.2.0
-    - databricks-connect>=17.0.0
-    - databricks-sdk>=0.102.0
-    - mlflow>=3.12.0
-    # Must match the CUDA 13 build that environment v6 targets.
-    - torch==2.11.0
-    - accelerate>=1.11.0
-    - datasets>=3.6.0
-    - einops>=0.8.1
-    - hf_transfer>=0.1.9
-    - peft>=0.19.1
-    - safetensors>=0.5.0
-    # Qwen3.5 (Qwen3_5ForCausalLM) needs a newer transformers than env v6's 5.8.1.
-    - transformers>=5.13.0
-    - trl>=0.24.0
+
+# One 8xH100 node. Validate cheaply first with
+#   --override compute.accelerator_type=GPU_1xA10 --override compute.num_accelerators=1
 compute:
-  num_accelerators: 8
-  # GPU_1xA10 is enough for the 4B LoRA validation run; switch to GPU_8xH100
-  # for the scaled multi-GPU demo run.
   accelerator_type: GPU_8xH100
-env_variables:
-  # AIR CLI nodes don't set this, but the runtime image's bundled
-  # databricks-connect needs it to substitute its 'DBCONNECT_VERSION'
-  # placeholder — without it, DatabricksSession.builder.serverless() dies in
-  # validate_session_serverless with packaging InvalidVersion. The compat
-  # check only requires client <= server, and 15.4 is the AIR CLI's own
-  # legacy-launcher default.
-  DATABRICKS_RUNTIME_VERSION: '15.4'
+  num_accelerators: 8
+
+# Runs once per node. torchrun starts one DDP process per GPU; a single process
+# holding every GPU would fall back to nn.DataParallel, which Qwen3.5's Gated
+# DeltaNet layers cannot run. --standalone fits one node; multi-node runs need
+# the rendezvous flags AI Runtime sets ($NUM_NODES, $NODE_RANK,
+# $LOCAL_WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT) instead.
+command: torchrun --standalone --nproc_per_node=gpu $CODE_SOURCE_PATH/train.py
+
+# ---------------------------------------------------------------------------
+# Optional AI Runtime fields
+# ---------------------------------------------------------------------------
+# Custom image defined in train/docker/ and pushed to Unity Catalog Artifact
+# train/requirements.txt's packages.
+environment:
+  unity_catalog_image: ssa_team_sandbox_classic_catalog.air.air_demo_training:v1
+
+# Uploads this file's directory (train/) with every run — tracked files plus
+# untracked files .gitignore doesn't exclude — as $CODE_SOURCE_PATH, so code
+# changes need no image rebuild.
 code_source:
   type: snapshot
   snapshot:
     root_path: .
-# One process per GPU. `--nproc_per_node=gpu` follows whatever
-# compute.num_accelerators allocates, so `--override compute.num_accelerators=N`
-# still works, and it keeps HF Trainer on DDP: a single process holding every GPU
-# falls back to nn.DataParallel, which crashes Qwen3.5's Gated DeltaNet path and
-# reads only rank 0's shard slice. `--standalone` is right for a single-node
-# allocation; a multi-node workload needs real rendezvous arguments instead.
-command: torchrun --standalone --nproc_per_node=gpu $CODE_SOURCE_PATH/train.py
 
-# Demo configuration, carried in the workload's `parameters` field.
+# Workspace folder holding the experiment (created if missing), so runs land in
+# /Users/ben.doan@databricks.com/qwen35_4b_sft_training. The runner notebook
+# resolves the same path. Remove to use the submitting user's home folder.
+mlflow_experiment_directory: /Workspace/Users/ben.doan@databricks.com
+
+# Fail fast. The default is 3 retries, each a fresh workload and a new MLflow
+# run; raise it (--override max_retries=2) for long unattended runs.
+max_retries: 0
+
+# ---------------------------------------------------------------------------
+# Demo configuration
+# ---------------------------------------------------------------------------
+# Free-form. The CLI writes `parameters` to $HYPERPARAMETERS_PATH, which
+# train.py reads, so `--override parameters.training_config.<key>=VALUE`
+# reaches the script. The runner notebook reads the same section from this file.
 parameters:
   training_config:
     catalog: ssa_team_sandbox_classic_catalog
@@ -90,7 +79,7 @@ parameters:
     # Fraction of each rank's shard slice to train on (1.0 = every row), used by
     # BOTH launchers: the runner notebook passes this value into
     # run_rank_training(), and CLI runs can change it per run with
-    # `air run --override parameters.training_config.training_sample_fraction=...`.
+    # `--override parameters.training_config.training_sample_fraction=...`.
     training_sample_fraction: 0.001
     register_model: true
     deploy_endpoint: true

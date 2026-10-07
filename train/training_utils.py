@@ -182,32 +182,51 @@ def local_staging_dir(name: str) -> Path:
     )
 
 
-def resolve_experiment_path(experiment_name: str) -> str:
-    """Resolve an MLflow experiment name the way the AI Runtime CLI does.
+def resolve_experiment_path(experiment_name: str, experiment_directory: str | None = None) -> str:
+    """Resolve an MLflow experiment path the way AI Runtime does for CLI runs.
 
-    AIR resolves a workload's ``experiment_name`` to
-    ``/Users/<current user>/<experiment_name>``; notebook runs resolve the same
-    name through this helper so both launchers log to one experiment. A value
-    that is already a workspace path is returned unchanged.
+    AIR creates a CLI workload's ``experiment_name`` inside its
+    ``mlflow_experiment_directory`` (a ``/Workspace/...`` path), or in the
+    submitting user's home directory when that field is unset; notebook runs
+    resolve the same two ``train.yaml`` fields through this helper so both
+    launchers log to one experiment. A name that is already a workspace path is
+    returned unchanged.
     """
     if experiment_name.startswith("/"):
         return experiment_name
 
     from databricks.sdk import WorkspaceClient
 
-    user_name = WorkspaceClient().current_user.me().user_name
-    return f"/Users/{user_name}/{experiment_name}"
+    workspace_client = WorkspaceClient()
+    if not experiment_directory:
+        user_name = workspace_client.current_user.me().user_name
+        return f"/Users/{user_name}/{experiment_name}"
+
+    directory = experiment_directory.rstrip("/")
+    if not directory.startswith("/Workspace/"):
+        raise ValueError(
+            f"mlflow_experiment_directory must start with /Workspace/, got {experiment_directory!r}"
+        )
+    # The CLI creates a missing directory before submitting, but
+    # mlflow.set_experiment() fails on one — create it here too so notebook runs
+    # do not depend on a CLI run having happened first.
+    workspace_client.workspace.mkdirs(directory)
+    # MLflow names workspace experiments by their path without the /Workspace
+    # prefix that the AIR field requires.
+    return f"{directory.removeprefix('/Workspace')}/{experiment_name}"
 
 
 def load_training_config() -> dict:
     """Load the ``parameters.training_config`` section and derive shared names.
 
     Under an AI Runtime CLI workload the parameters arrive via the YAML file
-    at ``$HYPERPARAMETERS_PATH`` (which reflects ``air run --override``
-    values); otherwise they are read from ``train.yaml`` next to this file.
+    at ``$HYPERPARAMETERS_PATH`` (which reflects ``databricks air run
+    --override`` values); otherwise they are read from ``train.yaml`` next to
+    this file.
 
     Returns a flat dict of typed config values, the workload's
-    ``experiment_name``, derived UC names/paths, and quoted SQL identifiers,
+    ``experiment_name`` and ``mlflow_experiment_directory`` (``None`` when
+    unset), derived UC names/paths, and quoted SQL identifiers,
     intended to be bound into the caller's namespace with
     ``globals().update(load_training_config())``. Used by the training runner
     notebook and by train.py; deliberately a function (not top-level code) so
@@ -220,9 +239,9 @@ def load_training_config() -> dict:
         config_path = Path(hyperparameters_path)
         with config_path.open("r", encoding="utf-8") as config_file:
             loaded = yaml.safe_load(config_file)
-        # The AIR CLI docs say HYPERPARAMETERS_PATH holds just the
-        # `parameters` dict, but v0.1.0b1 points it at the full workload
-        # YAML — accept either shape.
+        # `databricks air run` writes just the `parameters` mapping
+        # (hyperparameters.yaml); the deprecated Python CLI (databricks-air
+        # v0.1.0b1) pointed it at the full workload YAML — accept either shape.
         workload_config = loaded if "parameters" in loaded else {}
         parameters = loaded.get("parameters", loaded)
     else:
@@ -230,16 +249,16 @@ def load_training_config() -> dict:
         parameters = config_value(workload_config, "parameters")
     config = config_value(parameters, "training_config")
 
-    # experiment_name is a top-level AIR workload field rather than part of
-    # training_config, and it is the only place the MLflow experiment is named:
-    # AIR resolves it for CLI runs, and the runner notebook resolves the same
-    # name through resolve_experiment_path(). When $HYPERPARAMETERS_PATH carries
-    # only the parameters dict, read it from the train.yaml in the snapshot.
-    if "experiment_name" in workload_config:
-        experiment_name = config_str(workload_config, "experiment_name")
-    else:
-        _, snapshot_workload_config = load_yaml_config("train.yaml")
-        experiment_name = config_str(snapshot_workload_config, "experiment_name")
+    # experiment_name and mlflow_experiment_directory are top-level AIR workload
+    # fields rather than part of training_config, and they are the only place
+    # the MLflow experiment is named: AIR resolves them for CLI runs, and the
+    # runner notebook resolves the same fields through resolve_experiment_path().
+    # When $HYPERPARAMETERS_PATH carries only the parameters dict, read them from
+    # the train.yaml in the snapshot.
+    if "experiment_name" not in workload_config:
+        _, workload_config = load_yaml_config("train.yaml")
+    experiment_name = config_str(workload_config, "experiment_name")
+    experiment_directory = workload_config.get("mlflow_experiment_directory")
 
     uc_catalog = config_str(config, "catalog")
     uc_schema = config_str(config, "schema")
@@ -254,6 +273,7 @@ def load_training_config() -> dict:
     return {
         "CONFIG_PATH": config_path,
         "EXPERIMENT_NAME": experiment_name,
+        "EXPERIMENT_DIRECTORY": experiment_directory,
         "UC_CATALOG": uc_catalog,
         "UC_SCHEMA": uc_schema,
         "SOURCE_TABLE_NAME": source_table_name,

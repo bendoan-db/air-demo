@@ -1,3 +1,7 @@
+# The single training dependency list, installed by the runner notebook
+# (`%uv pip install -r requirements.txt` on AI v6) and by train/docker/Dockerfile
+# for CLI runs, so both launchers train on the same stack.
+
 # Shared notebook/runtime utilities.
 pyyaml>=6.0.2
 pandas>=2.2.0
@@ -8,8 +12,11 @@ databricks-sdk>=0.102.0
 mlflow>=3.12.0
 
 # GPU training stack (only needed on serverless GPU compute, not for local
-# Databricks Connect runs). Serverless GPU environment v6 no longer bundles
-# torch, so it is pinned here to the CUDA 13 build that v6 targets.
+# Databricks Connect runs). The AI v6 environment ships torch 2.11.0+cu130 —
+# only the Standard v6 environment omits torch — so this pin matches the bundled
+# CUDA 13 build and keeps any other requirement from swapping it out. PyPI's
+# torch 2.11.0 Linux wheel is that same CUDA 13 build, so the Dockerfile
+# installs it straight from this file.
 torch==2.11.0
 
 # Hugging Face fine-tuning stack: TRL supervised fine-tuning + PEFT LoRA.

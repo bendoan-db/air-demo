@@ -19,14 +19,14 @@
 # MAGIC %md
 # MAGIC ## Compute and dependency setup
 # MAGIC
-# MAGIC Attach this notebook to Databricks serverless compute with enough load-generator capacity for the configured request rate.
+# MAGIC Attach this notebook to Databricks serverless compute with enough load-generator capacity for the configured request rate, on environment version 5 or above: the install cell uses `%uv pip`, which classic compute and earlier serverless versions don't support.
 # MAGIC The serving endpoint must already exist and be in a ready state before the load test starts.
 # MAGIC
 # MAGIC The notebook uses `aiohttp` for asynchronous HTTP requests. The Databricks SDK is not used for the hot path because the load test needs connection pooling, high concurrency, and precise request pacing.
 
 # COMMAND ----------
 
-# MAGIC %pip install -qqq "aiohttp>=3.9.0" "pyyaml>=6.0.2" "pandas>=2.2.0" "requests>=2.31.0"
+# MAGIC %uv pip install -q "aiohttp>=3.9.0" "pyyaml>=6.0.2" "pandas>=2.2.0" "requests>=2.31.0"
 # MAGIC %restart_python
 
 # COMMAND ----------

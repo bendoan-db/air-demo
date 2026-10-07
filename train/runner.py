@@ -2,12 +2,12 @@
 # MAGIC %md
 # MAGIC ## Install notebook requirements
 # MAGIC
-# MAGIC Install the Python packages required by the notebook.
+# MAGIC Install the Python packages required by the notebook with `%uv pip`, the uv-backed (faster) drop-in for `%pip`. It needs a serverless notebook on environment version 5 or above, which the AI v6 environment satisfies.
 # MAGIC AI Runtime already includes many common AI and ML libraries; this cell makes the notebook reproducible when package versions need to be pinned for the project.
 
 # COMMAND ----------
 
-# MAGIC %pip install -qqq -r requirements.txt
+# MAGIC %uv pip install -q -r requirements.txt
 # MAGIC %restart_python
 
 # COMMAND ----------
@@ -40,7 +40,7 @@ from training_utils import (
 # MAGIC - `catalog`, `schema`, and `source_table` point to the governed transaction Delta table.
 # MAGIC - `sft_table` points to the prepared prompt/response Delta table.
 # MAGIC - `checkpoint_volume` controls where adapters and model artifacts are written.
-# MAGIC - The workload's top-level `experiment_name` names the MLflow experiment, so this notebook and AI Runtime CLI runs log to the same place.
+# MAGIC - The workload's top-level `experiment_name` and `mlflow_experiment_directory` name the MLflow experiment and the workspace folder that holds it, so this notebook and AI Runtime CLI runs log to the same place.
 # MAGIC - `max_steps`, batch size, and learning rate control the training cost and runtime.
 # MAGIC - `training_sample_fraction` controls how much of each rank's shard slice is trained on (`1.0` uses every row); this notebook and AI Runtime CLI runs both read it from `train.yaml`.
 # MAGIC
@@ -158,7 +158,7 @@ display(spark.table(sft_table_q).select('messages_json', 'assistant_response'))
 # MAGIC - Model registration is handled in a separate section after training completes.
 # MAGIC - GPU memory metrics are logged when CUDA is available, which helps compare the `gpus=1` and `gpus>1` runs.
 # MAGIC
-# MAGIC The training implementation lives in `train/train.py`, a plain Python module shared by two launchers: this notebook's `@distributed` cell and the AI Runtime CLI (`air run --file train.yaml`), which runs the same file standalone on serverless GPUs.
+# MAGIC The training implementation lives in `train/train.py`, a plain Python module shared by two launchers: this notebook's `@distributed` cell and the Databricks CLI's AI Runtime commands (`databricks air run --file train/train.yaml`), which run the same file standalone on serverless GPUs inside a custom training image built from `train/docker/Dockerfile` with the same `requirements.txt` this notebook installs.
 
 # COMMAND ----------
 
@@ -172,7 +172,7 @@ from serverless_gpu import distributed
 
 import mlflow
 
-MLFLOW_EXPERIMENT_PATH = resolve_experiment_path(EXPERIMENT_NAME)
+MLFLOW_EXPERIMENT_PATH = resolve_experiment_path(EXPERIMENT_NAME, EXPERIMENT_DIRECTORY)
 mlflow.set_experiment(MLFLOW_EXPERIMENT_PATH)
 
 print(f"MLflow experiment: {MLFLOW_EXPERIMENT_PATH}")
@@ -205,7 +205,7 @@ print(f"Trained adapter output dir: {TRAINED_ADAPTER_OUTPUT_DIR}")
 # MAGIC ## Merge the trained adapter
 # MAGIC
 # MAGIC Registration is split into three cells — merge, install the serving stack, register — because the training and serving environments cannot share one Python session.
-# MAGIC vLLM requires `opencv-python-headless>=4.13`, whose bundled OpenSSL aborts with `FATAL FIPS SELFTEST FAILURE` on Model Serving's FIPS pods, so opencv must be forced back to `4.12.0.88` in a second `pip` pass. A single `pip_requirements` list is resolved in one pass and cannot express that conflict, so the environment is built here in the notebook and captured by `env_pack` instead.
+# MAGIC vLLM requires `opencv-python-headless>=4.13`, whose bundled OpenSSL aborts with `FATAL FIPS SELFTEST FAILURE` on Model Serving's FIPS pods, so opencv must be forced back to `4.12.0.88` in a second install pass. A single `pip_requirements` list is resolved in one pass and cannot express that conflict, so the environment is built here in the notebook and captured by `env_pack` instead.
 # MAGIC
 # MAGIC This cell merges the rank-0 LoRA adapter into the base weights and writes plain Hugging Face weights to `/local_disk0`, which survives the `%restart_python` below and avoids the EAGAIN failures that large safetensors writes hit on `/Volumes`.
 # MAGIC
@@ -265,13 +265,13 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Install the serving stack (two pip passes)
+# MAGIC ## Install the serving stack (two `%uv pip` passes)
 # MAGIC
 # MAGIC These pins mirror a Custom LLM Serving deployment validated on a live workspace, and the order matters:
 # MAGIC
 # MAGIC 1. **vLLM first.** `vllm==0.24.0` is the version proven on Custom LLM Serving and new enough to register Qwen3.5's architecture. `mlflow==3.12` is uninstallable beside it (starlette conflict), hence `mlflow==3.14.0`.
-# MAGIC 2. **opencv second**, downgrading what vLLM just pulled in. `pip` prints a dependency-conflict warning and that is expected. Anything `>=4.13` bundles an OpenSSL that fails the FIPS self-test and aborts vLLM at startup.
-# MAGIC 3. `flashinfer-cubin` is **not** pinned here: vLLM depends on an exact version (`vllm==0.24.0` requires `flashinfer-cubin==0.6.12`), so pinning one yourself is an instant `ResolutionImpossible`. Databricks' starter notebook pins `0.5.2` because it pairs with `vllm==0.11.2`. Either way the precompiled cubins arrive, which is what stops the sampler JIT-compiling in a container with no `ninja`/`nvcc`.
+# MAGIC 2. **opencv second**, downgrading what vLLM just pulled in. `%uv pip` does not check for conflicts against packages already installed, so this goes through silently (`%pip` would print a dependency-conflict warning instead) — the mismatch with vLLM's `opencv>=4.13` floor is expected either way. Anything `>=4.13` bundles an OpenSSL that fails the FIPS self-test and aborts vLLM at startup.
+# MAGIC 3. `flashinfer-cubin` is **not** pinned here: vLLM depends on an exact version (`vllm==0.24.0` requires `flashinfer-cubin==0.6.12`), so pinning one yourself fails dependency resolution outright. Databricks' starter notebook pins `0.5.2` because it pairs with `vllm==0.11.2`. Either way the precompiled cubins arrive, which is what stops the sampler JIT-compiling in a container with no `ninja`/`nvcc`.
 # MAGIC
 # MAGIC `env_pack="databricks_model_serving"` packs this environment into the registered model version, which is why the serving stack is installed here instead of declared as `pip_requirements`.
 # MAGIC
@@ -279,8 +279,8 @@ else:
 
 # COMMAND ----------
 
-# MAGIC %pip install vllm==0.24.0 transformers==5.13.0 mlflow==3.14.0 openai==2.17.0 hf_transfer==0.1.9 databricks-sdk>=0.102.0
-# MAGIC %pip install opencv-python-headless==4.12.0.88
+# MAGIC %uv pip install vllm==0.24.0 transformers==5.13.0 mlflow==3.14.0 openai==2.17.0 hf_transfer==0.1.9 "databricks-sdk>=0.102.0"
+# MAGIC %uv pip install opencv-python-headless==4.12.0.88
 # MAGIC %restart_python
 
 # COMMAND ----------
@@ -319,7 +319,7 @@ from training_utils import (
 # The restart wiped the bindings from the configuration cell; reload them so the
 # registration and deployment cells see the same constants as training did.
 globals().update(load_training_config())
-mlflow.set_experiment(resolve_experiment_path(EXPERIMENT_NAME))
+mlflow.set_experiment(resolve_experiment_path(EXPERIMENT_NAME, EXPERIMENT_DIRECTORY))
 
 CUSTOM_LLM_TASK = "llm/v1/chat"
 CUSTOM_LLM_MODEL_ARTIFACT_NAME = "qwen35_fraud_model"

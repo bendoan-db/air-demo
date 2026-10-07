@@ -5,8 +5,9 @@ This module owns the Hugging Face LoRA supervised fine-tuning implementation
 
 - Imported by the ``runner`` notebook, whose ``@distributed`` cell calls
   :func:`run_rank_training` on each GPU worker.
-- Executed directly as ``python train.py`` by the AI Runtime CLI
-  (``air run --file train.yaml``), where each GPU worker runs this file.
+- Executed directly by the Databricks CLI's AI Runtime commands
+  (``databricks air run --file train.yaml``), where ``torchrun`` starts one
+  process per GPU running this file.
 
 Configuration comes from the ``parameters.training_config`` section of
 ``train.yaml`` (the same file that defines the AI Runtime CLI workload;
@@ -40,10 +41,11 @@ from training_utils import load_training_config, resolve_experiment_path
 # binds into its session.
 globals().update(load_training_config())
 
-# The AI Runtime CLI launch wrapper exports these before running the script;
-# neither is present under the notebook's @distributed path. Used to label
-# MLflow runs with their launcher so CLI and notebook runs are
-# distinguishable in the experiment.
+# AI Runtime exports these on every node of a CLI workload (`databricks air
+# run`): CODE_SOURCE_PATH whenever code_source is set, HYPERPARAMETERS_PATH
+# whenever the YAML has `parameters`. Neither is present under the notebook's
+# @distributed path. Used to label MLflow runs with their launcher so CLI and
+# notebook runs are distinguishable in the experiment.
 LAUNCHED_VIA_AIR_CLI = bool(
     os.environ.get("HYPERPARAMETERS_PATH") or os.environ.get("CODE_SOURCE_PATH")
 )
@@ -425,9 +427,10 @@ def train_qwen3_sft(
 
     if experiment_path and is_main_process:
         # Notebook runs pass the experiment path their driver resolved from
-        # train.yaml's `experiment_name`, so rank 0 logs to the same experiment
-        # as AIR CLI runs rather than depending on the launcher to propagate the
-        # driver's active experiment. AIR CLI runs leave this None: the
+        # train.yaml's `experiment_name` and `mlflow_experiment_directory`, so
+        # rank 0 logs to the same experiment as AIR CLI runs rather than
+        # depending on the launcher to propagate the driver's active experiment.
+        # AIR CLI runs leave this None when MLFLOW_RUN_ID is set: the
         # pre-created workload run already targets that experiment.
         mlflow.set_experiment(experiment_path)
 
@@ -547,8 +550,13 @@ def train_qwen3_sft(
         callbacks=[MLflowStepMetricsCallback()],
     )
 
+    # Under the CLI, AI Runtime pre-creates the workload's MLflow run, exports
+    # its id as MLFLOW_RUN_ID (which start_run picks up and resumes), and
+    # captures GPU/CPU/memory system metrics for it — so the in-process
+    # system-metrics monitor only runs on the notebook path, where nothing
+    # else records them.
     run_context = (
-        mlflow.start_run(run_name=run_name, log_system_metrics=True)
+        mlflow.start_run(run_name=run_name, log_system_metrics=not LAUNCHED_VIA_AIR_CLI)
         if is_main_process
         else nullcontext()
     )
@@ -558,9 +566,9 @@ def train_qwen3_sft(
             mlflow.set_tags(
                 {
                     "submitted_via": LAUNCHER,
-                    # AIR pre-creates the workload's MLflow run and start_run
-                    # resumes it, ignoring run_name — set the name explicitly
-                    # so the launcher-suffixed name sticks on both paths.
+                    # Resuming AIR's pre-created run ignores run_name — set the
+                    # name explicitly so the launcher-suffixed name sticks on
+                    # both paths.
                     "mlflow.runName": run_name,
                 }
             )
@@ -680,9 +688,10 @@ def run_rank_training(
     ``None`` and uses the config value.
 
     ``experiment_path`` is the resolved MLflow experiment rank 0 should log to
-    (``/Users/<user>/<experiment_name>``). The runner notebook passes the path
-    it resolved from ``train.yaml``'s ``experiment_name``; AIR CLI runs leave it
-    ``None`` because AIR already created the run in that experiment.
+    (``<mlflow_experiment_directory>/<experiment_name>``). The runner notebook
+    passes the path it resolved from those two ``train.yaml`` fields; AIR CLI
+    runs leave it ``None`` when ``MLFLOW_RUN_ID`` points at the run AIR already
+    created in that experiment.
 
     Returns the MLflow run id on rank 0 and ``None`` on other ranks.
     """
@@ -701,7 +710,7 @@ def run_rank_training(
     # Read the SFT records as parquet shard files from the UC volume instead
     # of querying Delta through Spark on the GPU workers, per the AIR
     # data-loading guidance for large Delta tables:
-    # https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
+    # https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-unity-catalog-volumes
     # Ingestion writes one shard_id=N directory per stable hash shard; each
     # rank claims the shards where N % world_size == rank, preserving the
     # original Delta rank-sharding contract.
@@ -766,10 +775,18 @@ def run_rank_training(
 
 def main() -> None:
     rank, world_size, _ = get_distributed_context()
-    # Under the AIR CLI the launcher already points the workload's run at
-    # /Users/<user>/<experiment_name>; a bare `python train.py` resolves the
-    # same name here so it lands in that experiment too.
-    experiment_path = None if LAUNCHED_VIA_AIR_CLI else resolve_experiment_path(EXPERIMENT_NAME)
+    # AIR pre-creates the workload's run in
+    # <mlflow_experiment_directory>/<experiment_name> and exports MLFLOW_RUN_ID,
+    # which start_run resumes. Resolve the same experiment here only when that
+    # run is absent — a bare `python train.py`, or a launcher that did not
+    # export it (the custom-image docs do not list MLFLOW_RUN_ID among the
+    # injected variables) — so rank 0 never starts a run with no experiment set.
+    # Only rank 0 opens a run, so the other ranks skip the workspace calls.
+    experiment_path = (
+        resolve_experiment_path(EXPERIMENT_NAME, EXPERIMENT_DIRECTORY)
+        if rank == 0 and not os.environ.get("MLFLOW_RUN_ID")
+        else None
+    )
     run_id = run_rank_training(experiment_path=experiment_path)
     if rank == 0:
         print(f"Training MLflow run ID: {run_id}")
